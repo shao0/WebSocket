@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>Web sockets test</title>
+<script src="https://github.com/nodeca/pako/blob/master/dist/pako.js"></script>
+</head>
+
+<body>
+    <p>输入WebSocket地址</p>
+    <input type="text" class="address" value="wss://broadcastlv.chat.bilibili.com/sub" />
+    <textarea class="content"></textarea>
+    <button class="but" onclick="OnConnect();">连接</button>
+</body>
+<script>
+    var q = document.querySelector.bind(document);
+
+    var c = console.log.bind(console)
+    //组合认证数据包
+    function getCertification(json) {
+        var bytes = str2bytes(json);  //字符串转bytes
+        var n1 = new ArrayBuffer(bytes.length + 16)
+        var i = new DataView(n1);
+        i.setUint32(0, bytes.length + 16), //封包总大小
+            i.setUint16(4, 16), //头部长度
+            i.setUint16(6, 1), //协议版本
+            i.setUint32(8, 7),  //操作码 7表示认证并加入房间
+            i.setUint32(12, 1); //就1
+        for (var r = 0; r < bytes.length; r++) {
+            i.setUint8(16 + r, bytes[r]); //把要认证的数据添加进去
+        }
+        return i; //返回
+    }
+
+    //字符串转bytes //这个方法是从网上找的QAQ
+    function str2bytes(str) {
+        const bytes = []
+        let c
+        const len = str.length
+        for (let i = 0; i < len; i++) {
+            c = str.charCodeAt(i)
+            if (c >= 0x010000 && c <= 0x10FFFF) {
+                bytes.push(((c >> 18) & 0x07) | 0xF0)
+                bytes.push(((c >> 12) & 0x3F) | 0x80)
+                bytes.push(((c >> 6) & 0x3F) | 0x80)
+                bytes.push((c & 0x3F) | 0x80)
+            } else if (c >= 0x000800 && c <= 0x00FFFF) {
+                bytes.push(((c >> 12) & 0x0F) | 0xE0)
+                bytes.push(((c >> 6) & 0x3F) | 0x80)
+                bytes.push((c & 0x3F) | 0x80)
+            } else if (c >= 0x000080 && c <= 0x0007FF) {
+                bytes.push(((c >> 6) & 0x1F) | 0xC0)
+                bytes.push((c & 0x3F) | 0x80)
+            } else {
+                bytes.push(c & 0xFF)
+            }
+        }
+        return bytes
+    }
+
+    function decode(blob) {
+        return new Promise(function (resolve, reject) {
+            let reader = new FileReader();
+            reader.onload = function (e) {
+                let buffer = new Uint8Array(e.target.result)
+                let result = {}
+                result.packetLen = readInt(buffer, 0, 4)
+                result.headerLen = readInt(buffer, 4, 2)
+                result.ver = readInt(buffer, 6, 2)
+                result.op = readInt(buffer, 8, 4)
+                result.seq = readInt(buffer, 12, 4)
+                if (result.op === 5) {
+                    result.body = []
+                    let offset = 0;
+                    while (offset < buffer.length) {
+                        let packetLen = readInt(buffer, offset + 0, 4)
+                        let headerLen = 16// readInt(buffer,offset + 4,4)
+                        let data = buffer.slice(offset + headerLen, offset + packetLen);
+
+                        /**
+                         * 仅有两处更改
+                         * 1. 引入pako做message解压处理，具体代码链接如下
+                         *    https://github.com/nodeca/pako/blob/master/dist/pako.js
+                         * 2. message文本中截断掉不需要的部分，避免JSON.parse时出现问题
+                         */
+                        /** let body = textDecoder.decode(pako.inflate(data));
+                        if (body) {
+                            // 同一条 message 中可能存在多条信息，用正则筛出来
+                            const group = body.split(/[\x00-\x1f]+/);
+                            group.forEach(item => {
+                              try {
+                                result.body.push(JSON.parse(item));
+                              }
+                              catch(e) {
+                                // 忽略非 JSON 字符串，通常情况下为分隔符
+                              }
+                            });
+                        }**/
+
+                        let body = '';
+                        try {
+                            // pako可能无法解压
+                            body = textDecoder.decode(pako.inflate(data));
+                        }
+                        catch (e) {
+                            body = textDecoder.decode(data)
+                        }
+
+                        if (body) {
+                            // 同一条 message 中可能存在多条信息，用正则筛出来
+                            const group = body.split(/[\x00-\x1f]+/);
+                            group.forEach(item => {
+                                try {
+                                    const parsedItem = JSON.parse(item);
+                                    if (typeof parsedItem === 'object') {
+                                        result.body.push(parsedItem);
+                                    } else {
+                                        // 这里item可能会解析出number
+                                        // 此时可以尝试重新用pako解压data（携带转换参数）
+                                        // const newBody = textDecoder.decode(pako.inflate(data, {to: 'String'}))
+                                        // 重复上面的逻辑，筛选可能存在的多条信息
+                                        // 初步验证，这里可以解析到INTERACT_WORD、DANMU_MSG、ONLINE_RANK_COUNT
+                                        // SEND_GIFT、SUPER_CHAT_MESSAGE
+                                    }
+                                }
+                                catch (e) {
+                                    // 忽略非 JSON 字符串，通常情况下为分隔符
+                                }
+                            });
+                        }
+
+                        offset += packetLen;
+                    }
+                } else if (result.op === 3) {
+                    result.body = {
+                        count: readInt(buffer, 16, 4)
+                    };
+                }
+                resolve(result)
+            }
+            reader.readAsArrayBuffer(blob);
+        });
+    }
+    function readInt(buffer, start, len) {
+        let result = 0
+        for (let i = len - 1; i >= 0; i--) {
+            result += Math.pow(256, len - i - 1) * buffer[start + i]
+        }
+        return result
+    }
+    function OnConnect() {
+        var address = q(".address");
+        var url = address.value;
+        var ws = new WebSocket(url);
+        ws.onopen = function () {
+            var room_id = 21144080;//上面获取到的room_id
+            var json = {
+                "uid": 0,
+                "roomid": room_id, //上面获取到的room_id
+                "protover": 1,
+                "platform": "web",
+                "clientver": "1.6.3"
+            }
+            console.log("WebSocket 已连接上");
+            ws.send(getCertification(JSON.stringify(json)).buffer);
+            //心跳包的定时器
+            timer = setInterval(function () { //定时器 注意声明timer变量
+                var n1 = new ArrayBuffer(16)
+                var i = new DataView(n1);
+                i.setUint32(0, 0),  //封包总大小
+                    i.setUint16(4, 16), //头部长度
+                    i.setUint16(6, 1), //协议版本
+                    i.setUint32(8, 2),  // 操作码 2 心跳包
+                    i.setUint32(12, 1); //就1
+                ws.send(i.buffer); //发送
+            }, 30000)   //30秒
+        };
+        //WebSocket接收数据回调
+        ws.onmessage = function (evt) {
+            const packet = decode(evt.data);
+            switch (packet.op) {
+                case 8:
+                    console.log('加入房间');
+                    break;
+                case 3:
+                    const count = packet.body.count
+                    console.log(`人气：${count}`);
+                    break;
+                case 5:
+                    packet.body.forEach((body) => {
+                        switch (body.cmd) {
+                            case 'DANMU_MSG':
+                                console.log(`${body.info[2][1]}: ${body.info[1]}`);
+                                break;
+                            case 'SEND_GIFT':
+                                console.log(`${body.data.uname} ${body.data.action} ${body.data.num} 个 ${body.data.giftName}`);
+                                break;
+                            case 'WELCOME':
+                                console.log(`欢迎 ${body.data.uname}`);
+                                break;
+                            // 此处省略很多其他通知类型
+                            default:
+                                console.log(body);
+                        }
+                    })
+                    break;
+                default:
+                    console.log(packet);
+            }
+        };
+    }
+</script>
+
+</html>
